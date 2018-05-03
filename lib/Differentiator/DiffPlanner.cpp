@@ -129,8 +129,13 @@ namespace clad {
   }
   DiffCollector::DiffCollector(DeclGroupRef DGR, DiffPlans& plans, Sema& S)
      : m_DiffPlans(plans), m_TopMostFDI(0), m_Sema(S) {
-    if (DGR.isSingleDecl())
+    llvm::outs () << ">in clad::DiffCollector" << '\n';
+    if (DGR.isSingleDecl()) {
+      llvm::outs () << ">calling Traverse on" << '\n';
+      DGR.getSingleDecl()->dump ();
+      llvm::outs () << '\n';
       TraverseDecl(DGR.getSingleDecl());
+    }
   }
 
   void DiffCollector::UpdatePlan(clang::FunctionDecl* FD, DiffPlan* plan) {
@@ -141,12 +146,28 @@ namespace clad {
     plan->setCurrentDerivativeOrder(plan->getCurrentDerivativeOrder() + 1);
     plan->push_back(FunctionDeclInfo(FD, FD->getParamDecl(plan->getArgIndex())));
     m_DiffPlans.push_back(*plan);
+    llvm::outs () << ">in clad::DiffCollector::UpdatePlan" << '\n';
+    llvm::outs () << ">calling Traverse on:" << '\n';
+    FD->dump ();
+    llvm::outs () << '\n';
     TraverseDecl(FD);
     m_DiffPlans.pop_back();
   }
 
   bool DiffCollector::VisitCallExpr(CallExpr* E) {
+    llvm::outs () << ">calling clad::DiffCollector::VisitCallExpr" << '\n';
+    llvm::outs () << ">on:" << '\n';
+    llvm::outs () << "E->getRawSubExprs():" << '\n';
+    for (auto && S : E->getRawSubExprs ()) {
+        S->printPretty (llvm::outs (), nullptr, clang::PrintingPolicy (clang::LangOptions ()));
+        llvm::outs () << '\n';
+    }
+    llvm::outs () << '\n';
+    llvm::outs () << "E->getDirectCallee():" << '\n';
     if (FunctionDecl *FD = E->getDirectCallee()) {
+      FD->printName (llvm::outs ());
+      llvm::outs () << '\n';
+
       if (m_TopMostFDI) {
         int index = -1;
         for (unsigned i = 0; i < m_TopMostFDI->getFD()->getNumParams(); ++i)
@@ -162,7 +183,7 @@ namespace clad {
       }
       // We need to find our 'special' diff annotated such:
       // clad::differentiate(...) __attribute__((annotate("D")))
-      else if (const AnnotateAttr* A = FD->getAttr<AnnotateAttr>())
+      else if (const AnnotateAttr* A = FD->getAttr<AnnotateAttr>()) {
         if (A->getAnnotation().equals("D")) {
           DeclRefExpr* DRE = 0;
 
@@ -199,6 +220,8 @@ namespace clad {
           }
         }
       }
+    }
+    else llvm::outs () << "<nullptr>" << '\n';
     return true;     // return false to abort visiting.
   }
 } // end namespace

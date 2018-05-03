@@ -83,6 +83,13 @@ namespace clad {
     }
 
     bool CladPlugin::HandleTopLevelDecl(DeclGroupRef DGR) {
+      llvm::outs () << ">calling CladPlugin::HandleTopLevel" << '\n';
+      llvm::outs () << ">on:" << '\n';
+      for (auto it = DGR.begin (); it != DGR.end (); ++it) {
+        (*it)->print (llvm::outs ());
+        llvm::outs () << '\n' << '\n';
+      }
+  
       if (m_CheckRuntime) {
         if (!CheckRuntime(m_CI.getSema()))
           return false;
