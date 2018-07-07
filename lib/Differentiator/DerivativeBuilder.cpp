@@ -1048,7 +1048,7 @@ namespace clad {
     else {
       II = &m_Context.Idents.get(FD->getNameAsString() + "_grad");
       // We also need to create an array to store the result of gradient call.
-      auto size_type_bits = m_Context.getIntWidth(m_Context.getSizeType());    
+      auto size_type_bits = m_Context.getIntWidth(m_Context.getSizeType());
       auto ArrayType =
         m_Context.getConstantArrayType(CE->getType(),
                                        llvm::APInt(size_type_bits, NArgs),
