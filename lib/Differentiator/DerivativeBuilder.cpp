@@ -1503,6 +1503,82 @@ namespace clad {
 
   ReverseModeVisitor::~ReverseModeVisitor() {}
 
+  RecordDecl* ReverseModeVisitor::CreateResultStruct(const std::string& structName,
+                                                     const NameTypePairs& fields) {
+    DeclContext* DC = m_Sema.CurContext;
+    IdentifierInfo* II = &m_Context.Idents.get(structName);
+    RecordDecl* RD = nullptr;
+    if (m_Sema.getLangOpts().CPlusPlus)
+      RD = CXXRecordDecl::Create(m_Context, TTK_Struct, DC, noLoc, noLoc, II);
+    else
+      RD = RecordDecl::Create(m_Context, TTK_Struct, DC, noLoc, noLoc, II);
+
+    RD->startDefinition();
+    for (const NameTypePair& nameType: fields) {
+      IdentifierInfo* II = &m_Context.Idents.get(nameType.first);
+      QualType T = nameType.second;
+      FieldDecl* FD = FieldDecl::Create(m_Context, RD, noLoc, noLoc, II, T,
+                                        nullptr, nullptr, false, ICIS_NoInit);
+      FD->setAccess(AS_public);
+      RD->addDecl(FD);
+    }
+    RD->completeDefinition();
+    return RD;
+    /*auto argIt = std::begin(args);
+    auto fieldIt = ResultStructDecl->field_begin();
+    while ((argIt != std::end(args)) && (fieldIt != ResultStructDecl->field_end())) {
+      FieldDecl* FD = *fieldIt;
+      const VarDecl* arg = *argIt;
+      if (FD->getNameAsString() != resultFieldNameFor(arg)) {
+        ++argIt;
+        continue;
+      }
+      Expr* result_of_arg = m_Sema.BuildFieldReferenceExpr(m_Result, false,
+        noLoc, CXXScopeSpec(), FD, DeclAccessPair::make(FD, FD->getAccess()),
+        DeclarationNameInfo(FD->getDeclName(), noLoc)).get();
+      m_Variables[arg] = result_of_arg;
+      ++argIt;
+      ++fieldIt;
+    } */
+  }
+
+  static bool isValidNumericType(QualType T) {
+    return T->isRealType();
+  }
+
+  static llvm::Optional<QualType>
+  getGradientResultTypeForType(ASTContext& C, QualType T, QualType RT,
+                               bool insideArrayType = false) {
+    if (T->isArrayType()) {
+      if (auto CAT = C.getAsConstantArrayType(T)) {
+        auto BT = getGradientResultTypeForType(C, CAT->getElementType(), RT, true);
+        if (!BT)
+          return llvm::None;
+        return C.getConstantArrayType(BT.getValue(), CAT->getSize(),
+                                      ArrayType::ArraySizeModifier::Normal,
+                                      CAT->getIndexTypeCVRQualifiers());
+      }
+      if (auto IAT = C.getAsIncompleteArrayType(T)) {
+        auto BT = getGradientResultTypeForType(C, IAT->getElementType(), RT, true);
+        if (!BT)
+          return llvm::None;
+        return C.getPointerType(BT.getValue());
+      }
+      return llvm::None;
+    }
+    if (T->isPointerType()) {
+      if (insideArrayType)
+        return llvm::None;
+      auto BT = getGradientResultTypeForType(C, T->getPointeeType(), RT);
+      if (!BT)
+        return llvm::None;
+      return C.getPointerType(BT.getValue());
+    }
+    if (isValidNumericType(T))
+      return RT;
+    return llvm::None;
+  }
+
   DeclWithContext ReverseModeVisitor::Derive(const FunctionDecl* FD,
                                              const DiffRequest& request) {
     silenceDiags = !request.VerboseDiags;
@@ -1529,25 +1605,73 @@ namespace clad {
     IdentifierInfo* II = &m_Context.Idents.get(gradientName);
     DeclarationNameInfo name(II, noLoc);
 
+    QualType ReturnType = m_Function->getReturnType();
+    if (!isValidNumericType(ReturnType)) {
+      diag(DiagnosticsEngine::Error, m_Function->getLocStart(),
+           "function returns unsupported type '%0', cannot differentiate",
+           { ReturnType.getAsString() });
+      return {};
+    }
+
+    /*auto resultFieldNameFor = [] (const VarDecl* VD) {
+      return "d_" + VD->getNameAsString();
+    };
+    NameTypePairs fields{};
+    for (const VarDecl* arg : args) {
+      std::string name = resultFieldNameFor(arg);
+      auto MaybeResultTy = getGradientResultTypeForType(m_Context,
+                                                        arg->getType(), ReturnType);
+      if (!MaybeResultTy) {
+        diag(DiagnosticsEngine::Warning, arg->getLocStart(),
+           "function argument is of unsupported type '%0', skipping",
+           { arg->getType().getAsString() });
+        continue;
+      }
+      QualType ResultTy = MaybeResultTy.getValue();
+      fields.emplace_back(std::move(name), ResultTy);
+    }
+    RecordDecl* ResultStructDecl = CreateResultStruct(gradientName + "_t", fields);
+    QualType ResultType = m_Context.getRecordType(ResultStructDecl);
+    ResultType = m_Context.getLValueReferenceType(ResultType);
+    */
     // A vector of types of the gradient function parameters.
-    llvm::SmallVector<QualType, 16> paramTypes(m_Function->getNumParams() + 1);
-    std::transform(m_Function->param_begin(),
-                   m_Function->param_end(),
-                   std::begin(paramTypes),
+    llvm::SmallVector<QualType, 16> paramTypes{};
+    paramTypes.push_back(ReturnType);
+
+    auto resultNameFor = [] (llvm::StringRef name) {
+      return ("_d_" + name).str();
+    };
+    auto resultTypeFor = [&] (QualType T) {
+      QualType R = T;
+      if (!R->isPointerType() && !R->isArrayType())
+        R = m_Context.getLValueReferenceType(R);
+      return R;
+    };
+    for (const VarDecl* arg : args) {
+      auto MaybeResultTy = getGradientResultTypeForType(m_Context,
+                                                        arg->getType(), ReturnType);
+      if (!MaybeResultTy) {
+        diag(DiagnosticsEngine::Error, arg->getLocStart(),
+           "function argument is of unsupported type '%0'",
+           { arg->getType().getAsString() });
+        return {};
+      }
+      QualType ResultTy = MaybeResultTy.getValue();
+      ResultTy = resultTypeFor(ResultTy);
+      paramTypes.push_back(ResultTy);
+    }
+    std::transform(m_Function->param_begin(), m_Function->param_end(),
+                   std::back_inserter(paramTypes),
                    [] (const ParmVarDecl* PVD) {
                      return PVD->getType();
                    });
-    // The last parameter is the output parameter of the R* type.
-    paramTypes.back() = m_Context.getPointerType(m_Function->getReturnType());
     // For a function f of type R(A1, A2, ..., An),
-    // the type of the gradient function is void(A1, A2, ..., An, R*).
+    // the type of the gradient function is void(S&, A1, A2, ..., An).
     QualType gradientFunctionType =
       m_Context.getFunctionType(m_Context.VoidTy,
                                 llvm::ArrayRef<QualType>(paramTypes.data(),
                                                          paramTypes.size()),
-                                // Cast to function pointer.
-                                FunctionProtoType::ExtProtoInfo());
-
+                                FunctionProtoType::ExtProtoInfo(CC_C));
     // Create the gradient function declaration.
     FunctionDecl* gradientFD = nullptr;
     NamespaceDecl* enclosingNS = nullptr;
@@ -1593,68 +1717,52 @@ namespace clad {
     m_Sema.PushFunctionScope();
     m_Sema.PushDeclContext(getCurrentScope(), m_Derivative);
 
+    auto BuildParmVarDecl = [&] (std::string name, QualType T,
+                                 TypeSourceInfo* TInfo, StorageClass S,
+                                 Expr* DefArg) {
+      IdentifierInfo* Id = &m_Context.Idents.get(name);
+      auto PVD = ParmVarDecl::Create(m_Context, gradientFD, noLoc, noLoc, Id,
+                                     T, TInfo, S, DefArg);
+      if (PVD->getIdentifier())
+        m_Sema.PushOnScopeChains(PVD, getCurrentScope(), /*AddToContext*/ false);
+      return PVD;
+    };
+
     // Create parameter declarations.
-    llvm::SmallVector<ParmVarDecl*, 4> params(paramTypes.size());
+    llvm::SmallVector<ParmVarDecl*, 4> params{};
+    auto seed = BuildParmVarDecl(resultNameFor(derivativeBaseName),
+                                 ReturnType, nullptr, SC_None, nullptr);
+    params.push_back(seed);
+    m_Result = BuildDeclRef(seed);
+    std::transform(std::begin(args), std::end(args), std::next(std::begin(paramTypes)),
+      std::back_inserter(params),
+      [&] (const VarDecl* arg, QualType T) {
+        return BuildParmVarDecl(resultNameFor(arg->getNameAsString()), T,
+                                nullptr, SC_None, nullptr);
+      });
     std::transform(m_Function->param_begin(), m_Function->param_end(), 
-      std::begin(params),
+      std::back_inserter(params),
       [&] (const ParmVarDecl* PVD) {
-        auto VD = ParmVarDecl::Create(m_Context, gradientFD, noLoc, noLoc,
-                                      PVD->getIdentifier(), PVD->getType(),
-                                      PVD->getTypeSourceInfo(),
-                                      PVD->getStorageClass(),
-                                      // Clone default arg if present.
-                                      (PVD->hasDefaultArg() ?
-                                        Clone(PVD->getDefaultArg()) : nullptr));
-        if (VD->getIdentifier())
-          m_Sema.PushOnScopeChains(VD, getCurrentScope(), /*AddToContext*/ false);
+        auto VD = BuildParmVarDecl(PVD->getNameAsString(), PVD->getType(),
+                                   PVD->getTypeSourceInfo(),
+                                   PVD->getStorageClass(),
+                                   // Clone default arg if present.
+                                   (PVD->hasDefaultArg() ?
+                                      Clone(PVD->getDefaultArg()) : nullptr));
         auto it = std::find(std::begin(args), std::end(args), PVD);
-        if (it != std::end(args))
+        if (it != std::end(args)) {
           *it = VD;
+          auto VDResult = params[1 + std::distance(std::begin(args), it)];
+          m_Variables[VD] = BuildDeclRef(VDResult);
+        }
         return VD;
     });
-    // The output paremeter "_result".
-    params.back() = ParmVarDecl::Create(m_Context, gradientFD, noLoc,
-                                        noLoc, &m_Context.Idents.get("_result"),
-                                        paramTypes.back(),
-                                        m_Context.getTrivialTypeSourceInfo(
-                                          paramTypes.back(), noLoc),
-                                        params.front()->getStorageClass(),
-                                        /* No default value */ nullptr);
-    if (params.back()->getIdentifier())
-      m_Sema.PushOnScopeChains(params.back(), getCurrentScope(),
-                               /*AddToContext*/ false);
 
     llvm::ArrayRef<ParmVarDecl*> paramsRef = llvm::makeArrayRef(params.data(),
                                                                 params.size());
     gradientFD->setParams(paramsRef);
     gradientFD->setBody(nullptr);
 
-    // Reference to the output parameter.
-    m_Result = BuildDeclRef(params.back());
-
-    auto idx = 0;
-    for (auto arg : args) {
-      // FIXME: fix when adding array inputs, now we are just skipping all
-      // array/pointer inputs (not treating them as independent variables).
-      if (arg->getType()->isArrayType() || arg->getType()->isPointerType()) {
-        if (arg->getName() == "p")
-          m_Variables[arg] = m_Result;
-        idx += 1;
-        continue;
-      }
-      auto size_type = m_Context.getSizeType();
-      auto size_type_bits = m_Context.getIntWidth(size_type);
-      // Create the idx literal.
-      auto i = IntegerLiteral::Create(m_Context, llvm::APInt(size_type_bits, idx),
-                                      size_type, noLoc);
-      // Create the _result[idx] expression.
-      auto result_at_i = m_Sema.CreateBuiltinArraySubscriptExpr(m_Result, noLoc,
-                                                                i, noLoc).get();
-      m_Variables[arg] = result_at_i;
-      idx += 1;
-    }
-
-    // Function body scope.
     beginScope(Scope::FnScope | Scope::DeclScope);
     m_DerivativeFnScope = getCurrentScope();
     beginBlock();
@@ -1686,7 +1794,6 @@ namespace clad {
     m_Sema.PopFunctionScopeInfo();
     m_Sema.PopDeclContext();
     endScope(); // Function decl scope
-
     return { gradientFD, enclosingNS };
   }
   
@@ -2064,11 +2171,7 @@ namespace clad {
   StmtDiff ReverseModeVisitor::VisitReturnStmt(const ReturnStmt* RS) {
     // Initially, df/df = 1.
     const Expr* value = RS->getRetValue();
-    QualType type = value->getType();
-    auto dfdf = ConstantFolder::synthesizeLiteral(m_Context.IntTy, m_Context, 1);
-    ExprResult tmp = dfdf;
-    dfdf = m_Sema.ImpCastExprToType(tmp.get(), type,
-                                    m_Sema.PrepareScalarCast(tmp, type)).get();
+    auto dfdf = m_Result;
     auto ReturnResult = DifferentiateSingleExpr(value, dfdf);
     StmtDiff ReturnDiff = ReturnResult.first;
     StmtDiff ExprDiff = ReturnResult.second;
@@ -2212,6 +2315,7 @@ namespace clad {
 
     llvm::SmallVector<Expr*, 16> CallArgs{};
     llvm::SmallVector<Expr*, 16> ReverseCallArgs{};
+    llvm::SmallVector<Expr*, 16> AdditionalReverseArgs{dfdx()};
     // If the result does not depend on the result of the call, just clone
     // the call and visit arguments (since they may contain side-effects like
     // f(x = y))
@@ -2235,10 +2339,27 @@ namespace clad {
       // so that they can be reffered to when arguments is visited. Variables
       // will be initialized later after arguments is visited. This is done to
       // reduce cloning complexity and only clone once.
-      Expr* dArg = StoreAndRef(nullptr, Arg->getType(), reverse, "_r", /*force*/true);
-      ArgResultDecls.push_back(cast<VarDecl>(cast<DeclRefExpr>(dArg)->getDecl()));
-      // Visit using unitialized reference.
-      StmtDiff ArgDiff = Visit(Arg, dArg);
+      StmtDiff ArgDiff;
+      if (Arg->isLValue()) {
+        ArgDiff = Visit(Arg, nullptr);
+        if (ArgDiff.getExpr()) {
+          AdditionalReverseArgs.push_back(ArgDiff.getExpr());
+        } else {
+          Expr* dArg = StoreAndRef(getZeroInit(Arg->getType()), Arg->getType(),
+                                   reverse, "_r", /*force*/true);
+          insertionPoint = getCurrentBlock(reverse).size();
+          AdditionalReverseArgs.push_back(dArg);
+        }
+        ArgResultDecls.push_back(nullptr);
+      } else {
+        Expr* dArg = StoreAndRef(nullptr, Arg->getType(), reverse, "_r",
+                                 /*force*/true);
+        insertionPoint = getCurrentBlock(reverse).size();
+        ArgResultDecls.push_back(cast<VarDecl>(cast<DeclRefExpr>(dArg)->getDecl()));
+        // Visit using unitialized reference.
+        ArgDiff = Visit(Arg, dArg);
+        AdditionalReverseArgs.push_back(dArg);
+      }
       // Save cloned arg in a "global" variable, so that it is accesible from the
       // reverse pass.
       ArgDiff = GlobalStoreAndRef(ArgDiff.getExpr());
@@ -2246,8 +2367,6 @@ namespace clad {
       ReverseCallArgs.push_back(ArgDiff.getExpr_dx());
     }
 
-    VarDecl* ResultDecl = nullptr;
-    Expr* Result = nullptr;
     Expr* OverloadedDerivedFn = nullptr;
     // If the function has a single arg, we look for a derivative w.r.t. to
     // this arg (it is unlikely that we need gradient of a one-dimensional'
@@ -2264,24 +2383,12 @@ namespace clad {
     }
     // If it has more args or f_darg0 was not found, we look for its gradient.
     if (!OverloadedDerivedFn) {
+      llvm::SmallVector<Expr*, 16> ExtendedReverseCallArgs =
+        std::move(AdditionalReverseArgs);
+      std::copy(std::begin(ReverseCallArgs), std::end(ReverseCallArgs),
+                std::back_inserter(ExtendedReverseCallArgs));
+      ReverseCallArgs = std::move(ExtendedReverseCallArgs);
       IdentifierInfo* II = &m_Context.Idents.get(FD->getNameAsString() + "_grad");
-      // We also need to create an array to store the result of gradient call.
-      auto size_type_bits = m_Context.getIntWidth(m_Context.getSizeType());
-      auto ArrayType =
-        m_Context.getConstantArrayType(CE->getType(),
-                                       llvm::APInt(size_type_bits, NArgs),
-                                       ArrayType::ArraySizeModifier::Normal,
-                                       0); // No IndexTypeQualifiers
-
-      // Create {} array initializer to fill it with zeroes.
-      auto ZeroInitBraces = m_Sema.ActOnInitList(noLoc, {}, noLoc).get();
-      // Declare: Type _gradX[Nargs] = {};
-      ResultDecl = BuildVarDecl(ArrayType, CreateUniqueIdentifier("_grad"),
-                                ZeroInitBraces);
-      Result = BuildDeclRef(ResultDecl);
-      // Pass the array as the last parameter for gradient.
-      ReverseCallArgs.push_back(Result);
-
       // Try to find it in builtin derivatives
       DeclarationName name(II);
       DeclarationNameInfo DNInfo(name, noLoc);
@@ -2335,7 +2442,8 @@ namespace clad {
       if (!asGrad) {
         // If the derivative is called through _darg0 instead of _grad.
         Expr* d = BuildOp(BO_Mul, dfdx(), OverloadedDerivedFn);
-        ArgResultDecls[0]->setInit(d);
+        if (ArgResultDecls[0])
+          m_Sema.AddInitializerToDecl(ArgResultDecls[0], d, false);
       } else {
         // Put Result array declaration in the function body.
         // Call the gradient, passing Result as the last Arg.
@@ -2343,20 +2451,14 @@ namespace clad {
         auto it = std::next(std::begin(block), insertionPoint);
         // Insert Result array declaration and gradient call to the block at
         // the saved point.
-        block.insert(it, { BuildDeclStmt(ResultDecl), OverloadedDerivedFn });
+        block.insert(it, { OverloadedDerivedFn });
         // Visit each arg with df/dargi = df/dxi * Result[i].
         for (unsigned i = 0; i < CE->getNumArgs(); i++) {
-          auto size_type = m_Context.getSizeType();
-          auto size_type_bits = m_Context.getIntWidth(size_type);
-          // Create the idx literal.
-          auto I = IntegerLiteral::Create(m_Context,
-                                          llvm::APInt(size_type_bits, i),
-                                          size_type, noLoc);
-          // Create the Result[I] expression.
-          auto ithResult = m_Sema.CreateBuiltinArraySubscriptExpr(Result, noLoc,
-                                                                  I, noLoc).get();
-          auto di = BuildOp(BO_Mul, dfdx(), ithResult);
-          ArgResultDecls[i]->setInit(di);
+          auto di = ReverseCallArgs[1 + i];
+          if (ArgResultDecls[i])
+            m_Sema.AddInitializerToDecl(ArgResultDecls[i], 
+                                        getZeroInit(ArgResultDecls[i]->getType()),
+                                        false);
         }
       }
     }

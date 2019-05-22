@@ -36,7 +36,7 @@ namespace clad {
     }
    
     std::size_t size() const {
-      return size;
+      return _size;
     }
    
     iterator begin() {

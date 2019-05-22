@@ -555,6 +555,10 @@ namespace clad {
     /// to the tape and constructed calls to push/pop methods.
     CladTapeResult MakeCladTapeFor(clang::Expr* E);
 
+    using NameTypePair = std::pair<std::string, clang::QualType>;
+    using NameTypePairs = llvm::SmallVector<NameTypePair, 16>;
+    clang::RecordDecl* CreateResultStruct(const std::string& name,
+                                          const NameTypePairs& fields);
   public:
     ReverseModeVisitor(DerivativeBuilder& builder);
     ~ReverseModeVisitor();
